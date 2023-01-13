@@ -47,13 +47,13 @@ class ODEBlock_feat(nn.Module):
         return out[1]
 
 class ODEblock(nn.Module):
-  def __init__(self, odefunc, in_features, out_features, adj, t):
+  def __init__(self, odefunc, in_features, out_features, p, adj, t):
     super(ODEblock, self).__init__()
     self.t = t
     
     self.aug_dim = 1 
     self.hidden_dim = 16
-    self.odefunc = odefunc(in_features, out_features, adj)
+    self.odefunc = odefunc(in_features, out_features, p, adj)
     self.train_integrator = odeint
     self.test_integrator = None
     self.set_tol()
@@ -116,13 +116,13 @@ class LaplacianODEFunc(ODEFunc):
 
 class ODEFuncTransformerAtt(ODEFunc):
 
-  def __init__(self, in_features, out_features, adj):
+  def __init__(self, in_features, out_features, p, adj):
     super(ODEFuncTransformerAtt, self).__init__()
     
     self.edge_index1 = adj._indices().to(device)
     self.edge_attr = adj._values().to(device)
     self.edge_index, self.edge_weight = add_remaining_self_loops(self.edge_index1, self.edge_attr, fill_value=1)
-    
+    self.p = p
     self.multihead_att_layer = SpGraphTransAttentionLayer(in_features, out_features, edge_weights=self.edge_weight).to(device)
     
   def multiply_attention(self, x, attention, v=None):
@@ -140,20 +140,20 @@ class ODEFuncTransformerAtt(ODEFunc):
         grad_x = torch_sparse.spmm(self.edge_index, mean_attention, x.shape[0], x.shape[0], x) - x
         grad_x_abs = torch.abs(grad_x)
         grad_x_norm = torch.sqrt(torch.sum(torch.clamp(grad_x_abs*grad_x_abs, max=10, min=1e-1), 1))
-        grad_x_norm_inv = torch.pow(grad_x_norm, 1)
+        grad_x_norm_inv = torch.pow(grad_x_norm, self.p) 
         attention2 = grad_x_norm_inv[self.edge_index[0,:]] + grad_x_norm_inv[self.edge_index[1,:]]
-        new_attn = mean_attention * attention2
-        Da = torch.diag(grad_x_norm_inv)
-        
+        new_attn = mean_attention * softmax(attention2, self.edge_index[0])
+        W = torch.sparse.FloatTensor(self.edge_index, new_attn, (x.shape[0], x.shape[0])).coalesce()
+        rowsum = torch.sparse.mm(W, torch.ones((W.shape[0], 1), device=device)).flatten()
+        diag_index = torch.stack((torch.arange(x.shape[0]), torch.arange(x.shape[0]))).to(device)
+        dx = torch_sparse.spmm(diag_index, rowsum, x.shape[0], x.shape[0], x)
         ax = torch_sparse.spmm(self.edge_index, new_attn, x.shape[0], x.shape[0], x)
-    return ax, Da
+    return ax-dx
 
   def forward(self, t, x):  # t is needed when called by the integrator
     
     attention, values = self.multihead_att_layer(x, self.edge_index)
-    ax, Da = self.multiply_attention(x, attention, values)
-    
-    f = (ax - x)
+    f = self.multiply_attention(x, attention, values)
     return f
 
   def __repr__(self):
@@ -298,9 +298,9 @@ class AttODEblock(ODEblock):
            + ")"
 
 class RewireAttODEblock(ODEblock):
-  def __init__(self, odefunc, in_features, out_features, adj, t=torch.tensor([0, 1]), training=True):
-    super(RewireAttODEblock, self).__init__(odefunc, in_features, out_features, adj, t)
-    self.odefunc = odefunc(in_features, out_features, adj)
+  def __init__(self, odefunc, in_features, out_features, p, adj, t=torch.tensor([0, 1]), training=True):
+    super(RewireAttODEblock, self).__init__(odefunc, in_features, out_features, p, adj, t)
+    self.odefunc = odefunc(in_features, out_features, p, adj)
     self.num_nodes = int(adj.size()[0])
     edge_index = adj._indices()
     edge_attr = adj._values()
@@ -310,7 +310,7 @@ class RewireAttODEblock(ODEblock):
                                          dtype=edge_attr.dtype)
     self.training = training
     if self.training:
-        self.dropedge_perc = 1
+        self.dropedge_perc = .5
         if self.dropedge_perc < 1:
             nnz = len(edge_attr)
             perm = np.random.permutation(nnz)
@@ -495,6 +495,7 @@ class pLAPLACE(nn.Module):
                  out_features,
                  hidden_features,
                  n_layers,
+                 p=1, #p>=1
                  activation=F.relu,
                  layer_norm=False,
                  residual=False,
@@ -519,6 +520,7 @@ class pLAPLACE(nn.Module):
                 self.layers.append(nn.LayerNorm(n_features[i]))
             self.layers.append(GCNConv(in_features=n_features[i],
                                        out_features=n_features[i + 1],
+                                       pnorm=p,
                                        activation=activation if i != n_layers - 1 else None,
                                        residual=residual if i != n_layers - 1 else False,
                                        dropout=dropout if i != n_layers - 1 else 0.0))
@@ -596,6 +598,7 @@ class GCNConv(nn.Module):
     def __init__(self,
                  in_features,
                  out_features,
+                 pnorm,
                  activation=None,
                  residual=False,
                  dropout=0.0):
@@ -604,7 +607,7 @@ class GCNConv(nn.Module):
         self.out_features = out_features
         self.linear = nn.Linear(in_features, out_features)
         self.time_tensor = torch.tensor([0, 1])
-        #self.odeblk = ODEBlock_feat(ODEfunc_feat(out_features))
+        self.p = pnorm
         
         if residual:
             self.residual = nn.Linear(in_features, out_features)
@@ -646,7 +649,7 @@ class GCNConv(nn.Module):
         x = self.linear(x)
         
         #block = AttODEblock(ODEFuncTransformerAtt, self.out_features, self.out_features, adj, self.time_tensor)
-        block = RewireAttODEblock(ODEFuncTransformerAtt, self.out_features, self.out_features, adj, self.time_tensor, self.training)
+        block = RewireAttODEblock(ODEFuncTransformerAtt, self.out_features, self.out_features, self.p, adj, self.time_tensor, self.training)
         
         block.set_x0(x)
         
